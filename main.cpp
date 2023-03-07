@@ -3,10 +3,11 @@
 
 #include "mbed.h"
 #include "spirit/include/A3921.h"
+#include "spirit/include/Error.h"
 #include "spirit/include/FakeUdpConverter.h"
 #include "spirit/include/Id.h"
 #include "spirit/include/MdLed.h"
-#include "spirit/include/PwmDataConverter.h"
+#include "spirit/include/MotorDataConverter.h"
 #include "spirit/platform/mbed/include/DigitalOut.h"
 #include "spirit/platform/mbed/include/PwmOut.h"
 
@@ -47,9 +48,9 @@ int main()
 
     spirit::MdLed mdled(led0, led1);
 
-    CANMessage               msg;
-    spirit::FakeUdpConverter fake_udp;
-    spirit::PwmDataConverter pwm_data;
+    CANMessage                 msg;
+    spirit::FakeUdpConverter   fake_udp;
+    spirit::MotorDataConverter motor_data;
 
     int32_t ttl = -1;
 
@@ -58,6 +59,7 @@ int main()
 
         // CANのfilterを使う場合、while文を以下のように書き換える
         // while (can.read(msg, filter_handle)) {
+        spirit::Motor motor;
         while (can.read(msg)) {
             if (msg.id == can_id) {
                 ttl = defalt_ttl;
@@ -67,20 +69,50 @@ int main()
                 std::size_t           payload_size;
                 fake_udp.decode(msg.data, msg.len * 8, max_payload_size, payload, payload_size);
 
-                spirit::Motor motor;
-                pwm_data.decode(payload, payload_size, motor);
-
-                a3921.duty_cycle(motor.get_duty_cycle());
-                a3921.state(motor.get_state());
-                a3921.run();
-
-                mdled.mode(spirit::MdLed::BlinkMode::Normal);
-                mdled.state(motor.get_state());
+                if (motor_data.decode(payload, payload_size, motor)) {
+                } else {
+                    spirit::Error& error = spirit::Error::get_instance();
+                    error.error(spirit::Error::Type::UnknownValue, 0, "Failed to decode", __FILE__, __func__, __LINE__);
+                }
             }
         }
 
         if (ttl > 0) {
             ttl--;
+            float                duty_cycle = 0.0f;
+            spirit::Motor::State state      = spirit::Motor::State::Brake;
+            switch (motor.get_control_system()) {
+                case spirit::Motor::ControlSystem::PWM:
+                    duty_cycle = motor.get_duty_cycle();
+                    state      = motor.get_state();
+                    break;
+                case spirit::Motor::ControlSystem::Speed:
+                    float speed;
+                    speed = motor.get_speed();
+                    state = motor.get_state();
+
+                    float Ki, Kp, Kd;
+                    motor.get_pid_gain_factor(Kp, Ki, Kd);  // Kd はデータが来ない
+
+                    /// @todo PID制御でデューティー比と回転方向を決定する
+
+                    break;
+                default:
+                    spirit::Error& error            = spirit::Error::get_instance();
+                    char           message_format[] = "Unknown motor control system (%d)";
+                    char           message[sizeof(message_format) + spirit::Error::max_uint32_t_length];
+                    snprintf(message, sizeof(message), message_format,
+                             static_cast<uint32_t>(motor.get_control_system()));
+                    error.error(spirit::Error::Type::UnknownValue, 0, message, __FILE__, __func__, __LINE__);
+                    break;
+            }
+
+            mdled.mode(spirit::MdLed::BlinkMode::Normal);
+            mdled.state(state);
+
+            a3921.duty_cycle(duty_cycle);
+            a3921.state(state);
+            a3921.run();
         } else if (ttl == 0) {
             // 一定時間データが来ないとき、安全のためモーターを停止させる
             a3921.state(spirit::Motor::State::Brake);
